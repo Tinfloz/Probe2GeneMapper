@@ -332,7 +332,7 @@ def infer_probe_mapping_strategy_with_retry(gpl_record: dict, progress: Inferenc
         return None
 
 
-def process_gpl_jsonl_parallel(gpl_dict: Dict[str, Dict], max_workers: int = 4):
+def process_gpl_jsonl_parallel(gpl_dict: Dict[str, Dict], api_key: Optional[str] = None, api_url: Optional[str] = None, max_workers: int = 4):
     """
     Process GPL records file with parallel inference
 
@@ -355,11 +355,16 @@ def process_gpl_jsonl_parallel(gpl_dict: Dict[str, Dict], max_workers: int = 4):
     print(f"🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
 
+    kwargs = {}
+    if api_url:
+        kwargs["api_url"] = api_url
+    if api_key:
+        kwargs["api_key"] = api_key 
+
     # Initialize progress tracker
-    progress = InferenceProgressTracker(len(gpl_records))
+    progress = InferenceProgressTracker(len(gpl_records), **kwargs)
     results = {}
     errors = {}
-    
     # Process GPLs in parallel
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -410,10 +415,8 @@ def process_gpl_jsonl_parallel(gpl_dict: Dict[str, Dict], max_workers: int = 4):
 def infer_probe_mapping_strategy(gpl_record: dict, api_url: str = None, api_key: str = None) -> str:
     """Original function for single GPL inference - kept for compatibility"""
     prompt = build_prompt(gpl_record)
-    print(f"\n--- PROMPT SENT TO GPT ---\n{prompt}\n")
-    
+    print(f"\n--- PROMPT SENT TO GPT ---\n{prompt}\n")    
     api_url = api_url or os.getenv("GPT_API_URL")
     api_key = api_key or os.getenv("GPT_API_KEY")
-    
     result = call_openai_chat_api_with_retry(prompt, api_url, api_key)
     return result
