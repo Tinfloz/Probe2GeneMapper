@@ -379,5 +379,4 @@ class GPLDatasetBuilder:
 #sample_gpls = ["GPL97", "GPL570", "GPL96"]
 #builder = GPLDatasetBuilder(max_rows=5, max_workers=2)
 #res = builder.build_dataset(sample_gpls)
-#print(res['results'])
-
+#print(res['results'])  

@@ -1,50 +1,157 @@
 import os
-import requests
 import json
 import time
 import threading
-import random
-from typing import Dict, Optional, List
+import logging
+from typing import Dict, Optional, List, Any, NamedTuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
 from datetime import datetime
-import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from jinja2 import Environment, BaseLoader, select_autoescape
 from dotenv import load_dotenv
 
 load_dotenv()
 
-class InferenceProgressTracker:
-    """Thread-safe progress tracker for GPL inference"""
 
-    def __init__(self, total_items: int, api_url: Optional[str] = None, api_key: Optional[str] = None):
+# Configuration Management
+@dataclass
+class APIConfig:
+    """API configuration with validation"""
+    api_url: str
+    api_key: str
+    model: str = "gpt-4o"
+    temperature: float = 0.2
+    timeout: int = 60
+    max_retries: int = 3
+    
+    def __post_init__(self):
+        if not self.api_url or not self.api_key:
+            raise ValueError("API URL and key are required")
+        if not self.api_url.startswith(('http://', 'https://')):
+            raise ValueError("API URL must be a valid HTTP/HTTPS URL")
+
+
+@dataclass 
+class ProcessingConfig:
+    """Processing configuration"""
+    max_workers: int = 4
+    batch_size: int = 100
+    progress_update_interval: float = 5.0
+    base_delay: float = 1.0
+    max_delay: float = 60.0
+    
+    def __post_init__(self):
+        if self.max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+
+
+# Data Models
+class ProcessingResult(NamedTuple):
+    """Result of processing a single GPL"""
+    gpl_id: str
+    success: bool
+    result: Optional[str]
+    error: Optional[str]
+    processing_time: float
+    retry_count: int = 0
+
+
+class ProcessingStats(NamedTuple):
+    """Processing statistics"""
+    total_requested: int
+    successful: int
+    failed: int
+    total_retries: int
+    success_rate_percent: float
+    total_processing_time_seconds: float
+    average_time_per_gpl_seconds: float
+    gpls_per_second: float
+    max_workers_used: int
+    processed_at: str
+
+
+# Custom Exceptions
+class GPLInferenceError(Exception):
+    """Base exception for GPL inference errors"""
+    pass
+
+
+class APIError(GPLInferenceError):
+    """API-related errors"""
+    pass
+
+
+class ConfigurationError(GPLInferenceError):
+    """Configuration-related errors"""
+    pass
+
+
+# Logging Configuration
+def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> logging.Logger:
+    """Setup logging configuration"""
+    logger = logging.getLogger("gpl_inference")
+    logger.setLevel(getattr(logging, log_level.upper()))
+    
+    # Remove existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler if specified
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    
+    return logger
+
+
+# Progress Tracking
+class InferenceProgressTracker:
+    """Thread-safe progress tracker with comprehensive metrics"""
+
+    def __init__(self, total_items: int, update_interval: float = 5.0):
         self.total = total_items
         self.completed = 0
         self.failed = 0
         self.retried = 0
         self.start_time = time.time()
+        self.update_interval = update_interval
         self.lock = threading.Lock()
         self.last_update = 0
-        self._api_url = api_url or os.getenv("GPT_API_URL")
-        self._api_key = api_key or os.getenv("GPT_API_KEY")
+        self.logger = logging.getLogger("gpl_inference.progress")
 
-    def update(self, status: str, gpl_id: str, details: str = "", retry_count: int = 0):
+    def update(self, result: ProcessingResult):
+        """Update progress with processing result"""
         with self.lock:
-            if status == "success":
+            if result.success:
                 self.completed += 1
-            elif status == "failed":
+            else:
                 self.failed += 1
-            elif status == "retry":
-                self.retried += 1
+            
+            self.retried += result.retry_count
 
-            # Update progress every item or every 5 seconds
+            # Update progress based on interval
             now = time.time()
-            processed = self.completed + self.failed
-
-            if processed % 1 == 0 or now - self.last_update > 5:
-                self.print_progress(gpl_id, details, retry_count)
+            if now - self.last_update >= self.update_interval:
+                self._print_progress(result.gpl_id)
                 self.last_update = now
 
-    def print_progress(self, current_gpl: str = "", details: str = "", retry_count: int = 0):
+    def _print_progress(self, current_gpl: str = ""):
+        """Print current progress"""
         elapsed = time.time() - self.start_time
         processed = self.completed + self.failed
         remaining = self.total - processed
@@ -64,359 +171,480 @@ class InferenceProgressTracker:
         filled = int(bar_length * processed / self.total) if self.total > 0 else 0
         bar = "█" * filled + "░" * (bar_length - filled)
 
-        retry_info = f" (retry {retry_count})" if retry_count > 0 else ""
-
         print(f"\r🤖 [{bar}] {percentage:5.1f}% | "
               f"✅ {self.completed} | ❌ {self.failed} | 🔄 {self.retried} | "
-              f"🚀 {rate:.1f}/s | ⏱️ ETA: {eta_minutes:.1f}m | 🎯 {current_gpl}{retry_info}",
+              f"🚀 {rate:.1f}/s | ⏱️ ETA: {eta_minutes:.1f}m | 🎯 {current_gpl}",
               end="", flush=True)
 
-        if details:
-            print(f" | {details}", end="", flush=True)
-
-    def final_report(self):
+    def get_final_stats(self) -> ProcessingStats:
+        """Get final processing statistics"""
         elapsed = time.time() - self.start_time
-        # Prevent division by zero
-        elapsed = max(elapsed, 0.001)  # Minimum 1ms to avoid division by zero
+        elapsed = max(elapsed, 0.001)  # Prevent division by zero
+        
+        return ProcessingStats(
+            total_requested=self.total,
+            successful=self.completed,
+            failed=self.failed,
+            total_retries=self.retried,
+            success_rate_percent=(self.completed / max(self.completed + self.failed, 1)) * 100,
+            total_processing_time_seconds=elapsed,
+            average_time_per_gpl_seconds=elapsed / max(self.total, 1),
+            gpls_per_second=self.total / elapsed,
+            max_workers_used=0,  # Will be set by caller
+            processed_at=datetime.now().isoformat()
+        )
+
+    def print_final_report(self, max_workers: int = 0):
+        """Print comprehensive final report"""
+        stats = self.get_final_stats()
+        stats = stats._replace(max_workers_used=max_workers)
         
         print(f"\n\n🎉 INFERENCE COMPLETE!")
         print(f"{'='*60}")
-        print(f"⏰ Total time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
-        print(f"✅ Successful: {self.completed}")
-        print(f"❌ Failed: {self.failed}")
-        print(f"🔄 Total retries: {self.retried}")
-        print(f"📈 Success rate: {(self.completed/(self.completed+self.failed)*100):.1f}%" if (self.completed+self.failed) > 0 else "N/A")
-        print(f"🚀 Average rate: {(self.completed+self.failed)/elapsed:.1f} GPL/second")
+        print(f"⏰ Total time: {stats.total_processing_time_seconds:.1f}s "
+              f"({stats.total_processing_time_seconds/60:.1f} minutes)")
+        print(f"✅ Successful: {stats.successful}")
+        print(f"❌ Failed: {stats.failed}")
+        print(f"🔄 Total retries: {stats.total_retries}")
+        print(f"📈 Success rate: {stats.success_rate_percent:.1f}%")
+        print(f"🚀 Average rate: {stats.gpls_per_second:.1f} GPL/second")
+        print(f"👥 Workers used: {max_workers}")
         print(f"{'='*60}")
 
 
-def exponential_backoff(attempt: int, base_delay: float = 1.0, max_delay: float = 60.0) -> float:
-    """Calculate exponential backoff delay with jitter"""
-    delay = min(base_delay * (2 ** attempt), max_delay)
-    # Add jitter (±25%)
-    jitter = delay * 0.25 * (2 * random.random() - 1)
-    return max(0, delay + jitter)
-
-def build_prompt(gpl_record: dict) -> str:
-    """Build prompt for GPL inference with proper string escaping"""
-    gpl_id = gpl_record.get("gpl_id", "")
-    metadata = gpl_record.get("metadata", {})
-    table = gpl_record.get("table", {})
-    columns = table.get("columns", [])
-    sample_rows = table.get("sample_rows", [])
-    column_descriptions = metadata.get("column_descriptions", {})
+# Prompt Engineering
+class PromptBuilder:
+    """Template-based prompt builder with proper escaping"""
     
-    # Safely build strings with proper escaping
-    if column_descriptions:
-        column_desc_parts = []
-        for k, v in column_descriptions.items():
-            # Escape any problematic characters in the description
-            safe_key = str(k).replace("{", "{{").replace("}", "}}")
-            safe_value = str(v).replace("{", "{{").replace("}", "}}")
-            column_desc_parts.append(f"**{safe_key}**: {safe_value}")
-        column_desc_str = "\n".join(column_desc_parts)
-    else:
-        column_desc_str = "No column descriptions available."
-    
-    # Build metadata string with escaping
-    metadata_parts = []
-    for k, v in metadata.items():
-        if k != "column_descriptions":
-            safe_key = str(k).replace("{", "{{").replace("}", "}}")
-            safe_value = str(v).replace("{", "{{").replace("}", "}}")
-            metadata_parts.append(f"- {safe_key}: {safe_value}")
-    metadata_str = "\n".join(metadata_parts)
+    PROMPT_TEMPLATE = """
+You are a biomedical data curation assistant.
 
-    # Build table with proper escaping
-    header_row = "\t".join(str(col) for col in columns)
-    row_strs = []
-    for row in sample_rows[:10]:
-        row_cells = []
-        for col in columns:
-            cell_value = str(row.get(col, "")).replace("{", "{{").replace("}", "}}")
-            row_cells.append(cell_value)
-        row_strs.append("\t".join(row_cells))
-    table_str = "\n".join([header_row] + row_strs)
+You are evaluating a GEO platform (GPL) to determine the best mapping strategy for **gene identifiers**, where the goal is to compare gene expression levels across disease vs control samples.
 
-    # Use string concatenation instead of f-string to avoid format issues
-    prompt = """
+Your job is to read the metadata, column descriptions, and example values, and decide:
 
-    You are a biomedical data curation assistant.
+1. Does the platform have probes that can be mapped to protein-coding genes?
 
-    You are evaluating a GEO platform (GPL) to determine the best mapping strategy for **gene identifiers**, where the goal is to compare gene expression levels across disease vs control samples.
+## Mapping Priority System
 
-    Your job is to read the metadata, column descriptions, and example values, and decide:
+When evaluating columns for gene mapping, use this **strict priority order** (highest to lowest):
 
-    1. Does the platform have probes that can be mapped to protein-coding genes?
+### Priority 1: Stable Database IDs (Most Reliable)
+- **Entrez Gene ID** / **Gene ID** / **GENE_NUM** (numeric identifiers like "2514089")
+- **Ensembl Gene ID** (ENSG* identifiers)
+- **Vega Gene ID** (OTTHUMG* identifiers - historical Vega project, now part of Ensembl)
+- **RefSeq mRNA** (NM_*, NR_* accessions)
+- **UniProt/SwissProt** (P*, Q* accessions like "Q13485")
 
-    ## Mapping Priority System
+### Priority 2: Sequence-based IDs
+- **GenBank accessions** (clear accession patterns)
+- **RefSeq protein** (NP_*, XP_* accessions)
 
-    When evaluating columns for gene mapping, use this **strict priority order** (highest to lowest):
+### Priority 3: Genomic Coordinates
+- **Chromosomal coordinates** (chr1:123-456 format)
+- **START/STOP positions** with chromosome info
 
-    ### Priority 1: Stable Database IDs (Most Reliable)
-    - **Entrez Gene ID** / **Gene ID** / **GENE_NUM** (numeric identifiers like "2514089")
-    - **Ensembl Gene ID** (ENSG* identifiers)
-    - **Vega Gene ID** (OTTHUMG* identifiers - historical Vega project, now part of Ensembl)
-    - **RefSeq mRNA** (NM_*, NR_* accessions)
-    - **UniProt/SwissProt** (P*, Q* accessions like "Q13485")
+### Priority 4: Gene Symbols (Least Reliable)
+- **Gene symbols/names** only if no higher priority options exist
+- These are prone to ambiguity and version changes
 
-    ### Priority 2: Sequence-based IDs
-    - **GenBank accessions** (clear accession patterns)
-    - **RefSeq protein** (NP_*, XP_* accessions)
+## Column Evaluation Process
 
-    ### Priority 3: Genomic Coordinates
-    - **Chromosomal coordinates** (chr1:123-456 format)
-    - **START/STOP positions** with chromosome info
+For each potential mapping column, evaluate:
 
-    ### Priority 4: Gene Symbols (Least Reliable)
-    - **Gene symbols/names** only if no higher priority options exist
-    - These are prone to ambiguity and version changes
+1. **Column name and description**: What type of identifier does it claim to contain?
+2. **Actual values**: Do the values match the expected pattern?
+3. **Population rate**: Are most values populated (not empty/null)?
+4. **Value format consistency**: Are values in expected format?
 
-    ## Column Evaluation Process
+## Mapping Method Classification
 
-    For each potential mapping column, evaluate:
+- **"direct"**: Platform provides direct gene symbols AND they are the best available option
+- **"accession_lookup"**: Platform provides database accessions (RefSeq, GenBank, UniProt, Entrez)
+- **"coordinate_lookup"**: Platform provides genomic coordinates
+- **"unknown"**: No reliable mapping method identified
 
-    1. **Column name and description**: What type of identifier does it claim to contain?
-    2. **Actual values**: Do the values match the expected pattern?
-    3. **Population rate**: Are most values populated (not empty/null)?
-    4. **Value format consistency**: Are values in expected format?
+## Analysis Instructions
 
-    ## Mapping Method Classification
+1. Identify ALL potential mapping columns by examining names, descriptions, and sample values  
+2. Rank identified columns by the priority system above  
+3. Select the highest priority column with good data quality
 
-    - **"direct"**: Platform provides direct gene symbols AND they are the best available option
-    - **"accession_lookup"**: Platform provides database accessions (RefSeq, GenBank, UniProt, Entrez)
-    - **"coordinate_lookup"**: Platform provides genomic coordinates
-    - **"unknown"**: No reliable mapping method identified
+**Output Format** (replace placeholders with actual data):
 
-    ## Analysis Instructions
+```json
+{
+  "gpl_id": "{{ gpl_id }}",
+  "organism": "{{ organism }}",
+  "mapping_method": "<direct|accession_lookup|coordinate_lookup|unknown>",
+  "description": "<explanation of mapping strategy and field chosen>",
+  "fields_used_for_mapping": ["<list of column names used>"],
+  "alternate_fields_for_mapping": ["<list of other viable mapping columns if available>"],
+  "available_fields": {{ available_fields | tojson }},
+  "mapping_priority_rationale": "<explanation of why this field was chosen>"
+}
+```
 
-    1. Identify ALL potential mapping columns by examining names, descriptions, and sample values  
-    2. Rank identified columns by the priority system above  
-    3. Select the highest priority column with good data quality
+**Platform Data**:
+- Platform ID: {{ gpl_id }}
+- Metadata:
+{% for key, value in metadata.items() %}
+  - {{ key }}: {{ value }}
+{% endfor %}
 
-    **Output Format** (replace placeholders with actual data):
+- Column Descriptions:
+{% if column_descriptions %}
+{% for key, value in column_descriptions.items() %}
+  **{{ key }}**: {{ value }}
+{% endfor %}
+{% else %}
+  No column descriptions available.
+{% endif %}
 
+- Sample Table:
+{{ table_header }}
+{% for row in sample_rows %}
+{{ row }}
+{% endfor %}
 
-    ```json
-    {
-    "gpl_id": "<actual GPL ID>",
-    "organism": "<actual organism>",
-    "mapping_method": "<direct|accession_lookup|coordinate_lookup|unknown>",
-    "description": "<explanation of mapping strategy and field chosen>",
-    "fields_used_for_mapping": ["<list of column names used>"],
-    "alternate_fields_for_mapping": ["<list of other viable mapping columns if available>"],
-    "available_fields": ["<list of all column names>"],
-    "mapping_priority_rationale": "<explanation of why this field was chosen>"
-    }
-    ```
+**Final Instruction**: Return only valid JSON with actual data for the GPL, based on the analysis. Do NOT include the placeholder template, code blocks, or any non-JSON content.
+""".strip()
 
-    **Platform Data**:
-    - Platform ID: """ + str(gpl_id) + """
-    - Metadata:
-    """ + metadata_str + """
-    - Column Descriptions:
-    """ + column_desc_str + """
-    - Sample Table:
-    """ + table_str + """
-
-    **Final Instruction**: Return only valid JSON with actual data for the GPL, based on the analysis. Do NOT include the placeholder template, code blocks, or any non-JSON content."""
-
-    return prompt.strip()
-
-
-def call_openai_chat_api_with_retry(prompt: str, api_url: str, api_key: str, model: str = "gpt-4o", max_retries: int = 5) -> str:
-    """Call OpenAI API with exponential backoff retry logic"""
-    if not api_key:
-        raise ValueError("API key is missing.")
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    data = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2
-    }
-
-    last_exception = None
-
-    for attempt in range(max_retries):
+    def __init__(self):
+        """Initialize prompt builder with Jinja2 environment"""
+        self.env = Environment(
+            loader=BaseLoader(),
+            autoescape=select_autoescape(['html', 'xml'])
+        )
+        
+    def build_prompt(self, gpl_record: Dict[str, Any]) -> str:
+        """Build prompt from GPL record using template"""
         try:
-            response = requests.post(api_url, headers=headers, json=data, timeout=60)
+            # Extract and validate data
+            gpl_id = gpl_record.get("gpl_id", "")
+            metadata = gpl_record.get("metadata", {})
+            table = gpl_record.get("table", {})
+            columns = table.get("columns", [])
+            sample_rows = table.get("sample_rows", [])
+            column_descriptions = metadata.get("column_descriptions", {})
+            
+            # Build template context
+            context = {
+                "gpl_id": gpl_id,
+                "organism": metadata.get("organism", ""),
+                "metadata": {k: v for k, v in metadata.items() if k != "column_descriptions"},
+                "column_descriptions": column_descriptions,
+                "available_fields": columns,
+                "table_header": "\t".join(columns),
+                "sample_rows": []
+            }
+            
+            # Format sample rows (limit to 10)
+            for row in sample_rows[:10]:
+                row_cells = [str(row.get(col, "")) for col in columns]
+                context["sample_rows"].append("\t".join(row_cells))
+            
+            # Render template
+            template = self.env.from_string(self.PROMPT_TEMPLATE)
+            return template.render(**context)
+            
+        except Exception as e:
+            raise GPLInferenceError(f"Failed to build prompt for {gpl_id}: {e}")
+
+
+# API Client
+class OpenAIClient:
+    """Robust OpenAI API client with retry logic"""
+    
+    def __init__(self, config: APIConfig):
+        self.config = config
+        self.logger = logging.getLogger("gpl_inference.api")
+        
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((requests.RequestException, APIError))
+    )
+    def _make_request(self, prompt: str) -> str:
+        """Make API request with retry logic"""
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        data = {
+            "model": self.config.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.config.temperature
+        }
+
+        try:
+            response = requests.post(
+                self.config.api_url, 
+                headers=headers, 
+                json=data, 
+                timeout=self.config.timeout
+            )
 
             # Handle rate limiting
             if response.status_code == 429:
                 retry_after = int(response.headers.get('retry-after', 60))
-                delay = min(retry_after, exponential_backoff(attempt, base_delay=2.0))
-                raise requests.exceptions.RequestException(f"Rate limited, retrying after {delay:.1f}s")
+                raise APIError(f"Rate limited, retry after {retry_after}s")
 
             response.raise_for_status()
             result = response.json()
 
-            content = result["choices"][0]["message"]["content"]
+            if 'choices' not in result or not result['choices']:
+                raise APIError("Invalid API response format")
 
-            # Parse JSON response
-            try:
-                content = content.strip()
-                if content.startswith("```json"):
-                    content = content[len("```json"):].strip()
-                if content.endswith("```"):
-                    content = content[:-3].strip()
-                return content
-            except json.JSONDecodeError as e:
-                if attempt == max_retries - 1:
-                    raise ValueError(f"Failed to parse GPT response: {e}\nRaw content:\n{content}")
-                last_exception = e
-
-        except Exception as e:
-            last_exception = e
-            if attempt == max_retries - 1:
-                break
-
-            # Calculate delay
-            delay = exponential_backoff(attempt)
-            time.sleep(delay)
-
-    raise last_exception or Exception("Max retries exceeded")
-
-
-def infer_probe_mapping_strategy_with_retry(gpl_record: dict, progress: InferenceProgressTracker) -> Optional[str]:
-    """Process a single GPL with retry logic"""
-    gpl_id = gpl_record.get("gpl_id", "unknown")
-    start_time = time.time()
-
-    try:
-        prompt = build_prompt(gpl_record)
-        
-        # Check if API credentials are available
-        if not progress._api_url or not progress._api_key:
-            progress.update("failed", gpl_id, "Missing API URL or key")
-            return None
-
-        for attempt in range(5):  # Max 5 retries
-            try:
-                if attempt > 0:
-                    progress.update("retry", gpl_id, f"Attempt {attempt + 1}", attempt)
-
-                result = call_openai_chat_api_with_retry(
-                    prompt, 
-                    progress._api_url, 
-                    progress._api_key, 
-                    max_retries=3
-                )
-
-                elapsed = time.time() - start_time
-                progress.update("success", gpl_id, f"Inferred in {elapsed:.1f}s")
-                return result
-
-            except Exception as e:
-                error_msg = str(e)
-                print(f"\n🔍 Debug - Attempt {attempt + 1} failed for {gpl_id}: {error_msg}")
+            content = result["choices"][0]["message"]["content"].strip()
+            
+            # Clean JSON response
+            if content.startswith("```json"):
+                content = content[7:].strip()
+            if content.endswith("```"):
+                content = content[:-3].strip()
                 
-                if attempt < 4:  # Will retry
-                    delay = exponential_backoff(attempt, base_delay=1.0)
-                    time.sleep(delay)
-                    continue
-                else:  # Final attempt failed
-                    elapsed = time.time() - start_time
-                    progress.update("failed", gpl_id, f"All retries failed: {error_msg[:50]}...")
-                    return None
+            return content
 
-    except Exception as e:
-        error_msg = str(e)
-        print(f"\n🔍 Debug - Outer exception for {gpl_id}: {error_msg}")
-        elapsed = time.time() - start_time
-        progress.update("failed", gpl_id, f"Error: {error_msg[:30]}...")
-        return None
+        except requests.RequestException as e:
+            self.logger.error(f"API request failed: {e}")
+            raise APIError(f"API request failed: {e}")
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse API response: {e}")
+            raise APIError(f"Invalid JSON response: {e}")
+
+    def infer_mapping_strategy(self, prompt: str) -> str:
+        """Get mapping strategy inference from API"""
+        try:
+            return self._make_request(prompt)
+        except Exception as e:
+            self.logger.error(f"Inference failed: {e}")
+            raise
 
 
-def process_gpl_jsonl_parallel(gpl_dict: Dict[str, Dict], api_key: Optional[str] = None, api_url: Optional[str] = None, max_workers: int = 4):
-    """
-    Process GPL records file with parallel inference
-
-    Args:
-        gpl_dict: Dictionary of GPL records
-        max_workers: Number of parallel workers (keep low to respect API limits)
-    """
-
-    # Load all GPL records
-    gpl_records = [value for value in gpl_dict.values()]
-    print(f"📋 Loaded {len(gpl_records)} GPL records")
-    if not gpl_records:
-        print("❌ No valid GPL records found!")
-        return
-
-    print(f"🚀 Starting GPL Inference Pipeline")
-    print(f"{'='*60}")
-    print(f"📋 Total GPLs to process: {len(gpl_records)}")
-    print(f"👥 Workers: {max_workers}")
-    print(f"🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*60}\n")
-
-    kwargs = {}
-    if api_url:
-        kwargs["api_url"] = api_url
-    if api_key:
-        kwargs["api_key"] = api_key 
-
-    # Initialize progress tracker
-    progress = InferenceProgressTracker(len(gpl_records), **kwargs)
-    results = {}
-    errors = {}
-    # Process GPLs in parallel
-    try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_gpl = {
-                executor.submit(infer_probe_mapping_strategy_with_retry, record, progress): record.get("gpl_id", "unknown")
-                for record in gpl_records
-            }
-
-            # Process completed tasks as they finish
-            for future in as_completed(future_to_gpl):
-                gpl_id = future_to_gpl[future]
-                try:
-                    result = future.result()
-                    if result:
-                        results[gpl_id] = result
-                    else:
-                        errors[gpl_id] = "Processing failed or no data"
-                except Exception as e:
-                    print(f"\n⚠️ Unexpected error for {gpl_id}: {e}")
-                    errors[gpl_id] = str(e)
-
-    except KeyboardInterrupt:
-        print(f"\n\n⚠️ Process interrupted by user!")
-
-    finally:
-        # Final progress report
-        progress.final_report()
-        print(f"\n✨ Inference complete! Returning results.")
+# Main Processing Engine
+class GPLInferenceEngine:
+    """Main processing engine for GPL inference"""
     
-    return {
-        'results': results,
-        'errors': errors,
-        'statistics': {
-            'total_requested': len(gpl_records),
-            'successful': len(results),
-            'failed': len(errors),
-            'success_rate_percent': (len(results) / len(gpl_records) * 100) if gpl_records else 0,
-            'total_processing_time_seconds': time.time() - progress.start_time,
-            'average_time_per_gpl_seconds': (time.time() - progress.start_time) / len(gpl_records) if gpl_records else 0,
-            'gpls_per_second': len(results) / (time.time() - progress.start_time) if (time.time() - progress.start_time) > 0 else 0,
-            'max_workers_used': max_workers,
-            'processed_at': datetime.now().isoformat()
+    def __init__(self, api_config: APIConfig, processing_config: ProcessingConfig):
+        self.api_config = api_config
+        self.processing_config = processing_config
+        self.prompt_builder = PromptBuilder()
+        self.api_client = OpenAIClient(api_config)
+        self.logger = logging.getLogger("gpl_inference.engine")
+        
+    def _process_single_gpl(self, gpl_record: Dict[str, Any], progress: InferenceProgressTracker) -> ProcessingResult:
+        """Process a single GPL record"""
+        gpl_id = gpl_record.get("gpl_id", "unknown")
+        start_time = time.time()
+        retry_count = 0
+
+        try:
+            # Build prompt
+            prompt = self.prompt_builder.build_prompt(gpl_record)
+            
+            # Get inference
+            result = self.api_client.infer_mapping_strategy(prompt)
+            
+            # Validate result is valid JSON
+            try:
+                json.loads(result)
+            except json.JSONDecodeError:
+                raise GPLInferenceError(f"Invalid JSON response for {gpl_id}")
+            
+            processing_time = time.time() - start_time
+            return ProcessingResult(
+                gpl_id=gpl_id,
+                success=True,
+                result=result,
+                error=None,
+                processing_time=processing_time,
+                retry_count=retry_count
+            )
+            
+        except Exception as e:
+            processing_time = time.time() - start_time
+            error_msg = str(e)
+            self.logger.error(f"Failed to process {gpl_id}: {error_msg}")
+            
+            return ProcessingResult(
+                gpl_id=gpl_id,
+                success=False,
+                result=None,
+                error=error_msg,
+                processing_time=processing_time,
+                retry_count=retry_count
+            )
+
+    def process_gpl_records(self, gpl_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Process multiple GPL records with parallel execution
+        
+        Args:
+            gpl_records: List of GPL record dictionaries
+            
+        Returns:
+            Dictionary with results, errors, and statistics
+        """
+        if not gpl_records:
+            raise ValueError("No GPL records provided")
+
+        self.logger.info(f"Starting processing of {len(gpl_records)} GPL records")
+        
+        print(f"🚀 Starting GPL Inference Pipeline")
+        print(f"{'='*60}")
+        print(f"📋 Total GPLs to process: {len(gpl_records)}")
+        print(f"👥 Workers: {self.processing_config.max_workers}")
+        print(f"🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}\n")
+
+        # Initialize progress tracker
+        progress = InferenceProgressTracker(
+            len(gpl_records), 
+            self.processing_config.progress_update_interval
+        )
+        
+        results = {}
+        errors = {}
+
+        try:
+            with ThreadPoolExecutor(max_workers=self.processing_config.max_workers) as executor:
+                # Submit all tasks
+                future_to_gpl = {
+                    executor.submit(self._process_single_gpl, record, progress): record.get("gpl_id", "unknown")
+                    for record in gpl_records
+                }
+
+                # Process completed tasks
+                for future in as_completed(future_to_gpl):
+                    gpl_id = future_to_gpl[future]
+                    try:
+                        result = future.result()
+                        progress.update(result)
+                        
+                        if result.success:
+                            results[gpl_id] = result.result
+                        else:
+                            errors[gpl_id] = result.error
+                            
+                    except Exception as e:
+                        error_msg = f"Unexpected error: {e}"
+                        self.logger.error(f"Unexpected error for {gpl_id}: {error_msg}")
+                        errors[gpl_id] = error_msg
+                        
+                        # Create failed result for progress tracking
+                        failed_result = ProcessingResult(
+                            gpl_id=gpl_id,
+                            success=False,
+                            result=None,
+                            error=error_msg,
+                            processing_time=0,
+                            retry_count=0
+                        )
+                        progress.update(failed_result)
+
+        except KeyboardInterrupt:
+            self.logger.warning("Process interrupted by user")
+            print(f"\n\n⚠️ Process interrupted by user!")
+
+        finally:
+            # Print final report
+            progress.print_final_report(self.processing_config.max_workers)
+            
+            stats = progress.get_final_stats()
+            stats = stats._replace(max_workers_used=self.processing_config.max_workers)
+            
+            self.logger.info(f"Processing complete. Success rate: {stats.success_rate_percent:.1f}%")
+
+        return {
+            'results': results,
+            'errors': errors,
+            'statistics': stats._asdict()
         }
-    }
 
 
-def infer_probe_mapping_strategy(gpl_record: dict, api_url: str = None, api_key: str = None) -> str:
-    """Original function for single GPL inference - kept for compatibility"""
-    prompt = build_prompt(gpl_record)
-    print(f"\n--- PROMPT SENT TO GPT ---\n{prompt}\n")    
-    api_url = api_url or os.getenv("GPT_API_URL")
-    api_key = api_key or os.getenv("GPT_API_KEY")
-    result = call_openai_chat_api_with_retry(prompt, api_url, api_key)
-    return result
+# Configuration Factory
+class ConfigurationFactory:
+    """Factory for creating configurations from environment variables"""
+    
+    @staticmethod
+    def create_api_config(
+        api_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model: str = "gpt-4o"
+    ) -> APIConfig:
+        """Create API configuration"""
+        api_url = api_url or os.getenv("GPT_API_URL")
+        api_key = api_key or os.getenv("GPT_API_KEY")
+        
+        if not api_url or not api_key:
+            raise ConfigurationError(
+                "API URL and key must be provided either as parameters or environment variables "
+                "(GPT_API_URL, GPT_API_KEY)"
+            )
+        
+        return APIConfig(
+            api_url=api_url,
+            api_key=api_key,
+            model=model
+        )
+    
+    @staticmethod
+    def create_processing_config(
+        max_workers: int = 4,
+        batch_size: int = 100
+    ) -> ProcessingConfig:
+        """Create processing configuration"""
+        return ProcessingConfig(
+            max_workers=max_workers,
+            batch_size=batch_size
+        )
+
+
+# Main Interface Function
+def process_gpl_inference(
+    gpl_records: List[Dict[str, Any]],
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: str = "gpt-4o",
+    max_workers: int = 4,
+    log_level: str = "INFO",
+    log_file: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Main interface function for GPL inference processing
+    
+    Args:
+        gpl_records: List of GPL record dictionaries
+        api_url: OpenAI API URL (or set GPT_API_URL env var)
+        api_key: OpenAI API key (or set GPT_API_KEY env var)
+        model: Model to use for inference
+        max_workers: Number of parallel workers
+        log_level: Logging level
+        log_file: Optional log file path
+        
+    Returns:
+        Dictionary with results, errors, and statistics
+    """
+    
+    # Setup logging
+    logger = setup_logging(log_level, log_file)
+    
+    try:
+        # Create configurations
+        kwargs = {}
+        if api_key:
+            kwargs['api_key'] = api_key
+        if api_url:
+            kwargs['api_url'] = api_url
+        api_config = ConfigurationFactory.create_api_config(**kwargs)
+        processing_config = ConfigurationFactory.create_processing_config(max_workers)
+        
+        # Create and run engine
+        engine = GPLInferenceEngine(api_config, processing_config)
+        return engine.process_gpl_records(gpl_records)
+        
+    except Exception as e:
+        logger.error(f"Processing failed: {e}")
+        raise
