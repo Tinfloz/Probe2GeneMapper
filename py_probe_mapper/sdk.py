@@ -5,7 +5,7 @@ import json
 from typing import Dict, List
 from py_probe_mapper.metadata_builder.build_metadata import GPLDatasetBuilder
 from py_probe_mapper.lookup_classifier.gpt_lookup_classifier import process_gpl_inference
-from py_probe_mapper.accession_lookup.accession_lookup import EnhancedSingleScriptGPLProcessor
+from py_probe_mapper.accession_lookup.accession_lookup import AccessionLookupGPLProcessor 
 
 def fetch_gene_to_probe_mappings(gpl_id: str, return_dataframe: bool = False) -> Dict[str, str]:
     try:
@@ -61,7 +61,7 @@ def runner(gpl_ids: List[str], api_url: str = None, api_key: str = None) -> None
         else:
             continue
     if len(accession_mappings) != 0:
-        accession_processor = EnhancedSingleScriptGPLProcessor(gpl_records=accession_mappings, zarr_path="gpl_mappings.zarr")
+        accession_processor = AccessionLookupGPLProcessor(gpl_records=accession_mappings, zarr_path="gpl_mappings.zarr")
         mappings = accession_processor.process_all_enhanced()
         for i in mappings.keys():
             with open(f"{i}_mappings.json", 'w') as f:

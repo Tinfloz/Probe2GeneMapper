@@ -436,7 +436,7 @@ class EnhancedGPLMapperV2:
             self.logger.error(f"GPL mapping failed: {str(e)}")
             return {"success": False, "reason": f"processing_error: {str(e)}"}
 
-class EnhancedSingleScriptGPLProcessor:
+class AccessionLookupGPLProcessor:
     """Lean GPL processor for programmatic usage with asynchronous HuggingFace upload."""
 
     def __init__(self, gpl_records: List[Dict[str, Any]], 
