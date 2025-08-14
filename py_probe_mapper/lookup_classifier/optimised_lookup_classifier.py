@@ -6,18 +6,17 @@ import logging
 from typing import Dict, Optional, List, Any, NamedTuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from jinja2 import Environment, BaseLoader, select_autoescape
 from dotenv import load_dotenv
+import random
+import math
 
 load_dotenv()
 
-"""
-Lower accuracy and token consumption - does not take into consideration elements such as -> population rate per column
-"""
 
 # Configuration Management
 @dataclass
@@ -39,18 +38,19 @@ class APIConfig:
 
 @dataclass 
 class ProcessingConfig:
-    """Processing configuration"""
+    """Processing configuration optimized for large datasets"""
     max_workers: int = 4
     batch_size: int = 100
     progress_update_interval: float = 5.0
-    base_delay: float = 1.0
-    max_delay: float = 60.0
+    sample_size: int = 400  # Optimal for 50k+ row datasets
+    min_sample_size: int = 100
+    quality_threshold: float = 0.7  # 70% population rate
     
     def __post_init__(self):
         if self.max_workers < 1:
             raise ValueError("max_workers must be >= 1")
-        if self.batch_size < 1:
-            raise ValueError("batch_size must be >= 1")
+        if self.sample_size < 50:
+            raise ValueError("sample_size must be >= 50")
 
 
 # Data Models
@@ -215,9 +215,68 @@ class InferenceProgressTracker:
         print(f"{'='*60}")
 
 
-# Prompt Engineering
-class PromptBuilder:
-    """Template-based prompt builder with proper escaping"""
+# Optimized Data Quality Analyzer for Large Datasets
+class DataQualityAnalyzer:
+    """Optimized data quality analysis for large datasets (50k+ rows)"""
+    
+    EMPTY_PATTERNS = {
+        "", "N/A", "NA", "n/a", "na", "NULL", "null", "Null",
+        "---", "--", "-", ".", "..", "...", "???",
+        "unknown", "Unknown", "UNKNOWN", "not available",
+        "not applicable", "none", "None", "NONE", "0",
+        "blank", "Blank", "BLANK", "empty", "Empty", "EMPTY",
+        "missing", "Missing", "MISSING", "no data", "NO DATA", "[]"
+    }
+    
+    def __init__(self, target_sample_size: int = 400):
+        self.target_sample_size = target_sample_size
+        self.logger = logging.getLogger("gpl_inference.quality")
+    
+    def optimize_sample(self, all_rows: List[Dict], columns: List[str]) -> List[Dict]:
+        """Create optimized sample using random sampling"""
+        if len(all_rows) <= self.target_sample_size:
+            return all_rows
+        
+        # Use random sampling for large datasets
+        return random.sample(all_rows, self.target_sample_size)
+    
+    def calculate_population_rates(self, sample_rows: List[Dict], columns: List[str]) -> Dict[str, float]:
+        """Calculate population rate for each column"""
+        if not sample_rows or not columns:
+            return {col: 0.0 for col in columns}
+        
+        population_rates = {}
+        for col in columns:
+            empty_count = 0
+            for row in sample_rows:
+                value = str(row.get(col, "")).strip()
+                if self._is_empty_value(value):
+                    empty_count += 1
+            population_rate = ((len(sample_rows) - empty_count) / len(sample_rows) * 100) if sample_rows else 0.0
+            
+            self.logger.debug(
+                f"Column {col}, Population Rate: {population_rate}% ({len(sample_rows) - empty_count}/{len(sample_rows)}), "
+                f"Empty Count: {empty_count}"
+            )
+            print(
+                f"DEBUG: Column {col}, Population Rate: {population_rate}% ({len(sample_rows) - empty_count}/{len(sample_rows)}), "
+                f"Empty Count: {empty_count}"
+            )
+            
+            population_rates[col] = population_rate
+        
+        return population_rates
+    
+    def _is_empty_value(self, value: str) -> bool:
+        """Check if value is empty or placeholder"""
+        if not value or len(value) <= 2:
+            return True
+        return value.strip() in self.EMPTY_PATTERNS
+
+
+# Optimized Prompt Builder
+class OptimizedPromptBuilder:
+    """Streamlined prompt builder optimized for large dataset inference"""
     
     PROMPT_TEMPLATE = """
 You are a biomedical data curation assistant.
@@ -244,8 +303,11 @@ When evaluating columns for gene mapping, use this **strict priority order** (hi
 - **RefSeq protein** (NP_*, XP_* accessions)
 
 ### Priority 3: Genomic Coordinates
-- **Chromosomal coordinates** (chr1:123-456 format)
-- **START/STOP positions** with chromosome info
+- A combination of 3 columns:
+    - **Chromosome** (indicators: 'chromosome', 'chr', 'seqname' in column name, case-insensitive)
+    - **Start position** (indicators: 'start', 'start_range', 'begin', 'range_start' in column name)
+    - **End position** (indicators: 'end', 'stop', 'end_range', 'range_end' in column name)
+- Or a single column with chr:start-end format (indicators: 'spot_id', 'spot', 'coordinate', 'position' in column name)
 
 ### Priority 4: Gene Symbols (Least Reliable)
 - **Gene symbols/names** only if no higher priority options exist
@@ -257,7 +319,10 @@ For each potential mapping column, evaluate:
 
 1. **Column name and description**: What type of identifier does it claim to contain?
 2. **Actual values**: Do the values match the expected pattern?
-3. **Population rate**: Are most values populated (not empty/null)?
+3. **Population rate** (non-empty values) using the population rates provided below:
+        {% for col, rate in population_rates.items() %}
+        **{{ col }}**: {{ rate }}%
+        {% endfor %}
 4. **Value format consistency**: Are values in expected format?
 
 ## Mapping Method Classification
@@ -267,95 +332,84 @@ For each potential mapping column, evaluate:
 - **"coordinate_lookup"**: Platform provides genomic coordinates
 - **"unknown"**: No reliable mapping method identified
 
-## Analysis Instructions
+### Analysis Process:
+1. Identify ALL potential mapping columns by examining column names, descriptions, and sample values
+2. Rank identified columns by their population rates and priority system above - lay more emphasis on the population rates
+3. For coordinates:
+   - Identify columns matching chromosome, start, and end indicators (case-insensitive) and check their population rates
+   - Or identify a single column with chr:start-end format (e.g., 'chr1:1000-2000')
+4. Select highest priority column that meets quality requirements
+5. If multiple columns qualify, prefer the column(s) with the highest population rate, especially if a lower-priority column has >=90% population rate and higher-priority columns have <50%
+6. If no high-priority column meets requirements, select best available lower-priority option
 
-1. Identify ALL potential mapping columns by examining names, descriptions, and sample values  
-2. Rank identified columns by the priority system above  
-3. Select the highest priority column with good data quality
+## CRITICAL: Population Rate Override
+If genomic coordinate column(s) have ≥90% population rate and accession fields have <90% population rate, 
+ALWAYS choose coordinate_lookup regardless of priority ranking.
 
-**Output Format** (replace placeholders with actual data):
+## Platform: {{ gpl_id }}
+Organism: {{ organism }}
+Sample Size: {{ sample_size }} rows (from {{ total_rows }} total)
 
-```json
-{
-  "gpl_id": "{{ gpl_id }}",
-  "organism": "{{ organism }}",
-  "mapping_method": "<direct|accession_lookup|coordinate_lookup|unknown>",
-  "description": "<explanation of mapping strategy and field chosen>",
-  "fields_used_for_mapping": ["<list of column names used>"],
-  "alternate_fields_for_mapping": ["<list of other viable mapping columns if available>"],
-  "available_fields": {{ available_fields | tojson }},
-  "mapping_priority_rationale": "<explanation of why this field was chosen>"
-}
-```
-
-**Platform Data**:
-- Platform ID: {{ gpl_id }}
-- Metadata:
-{% for key, value in metadata.items() %}
-  - {{ key }}: {{ value }}
+### Column Descriptions:
+{% for col, desc in column_descriptions.items() %}
+**{{ col }}**: {{ desc }}
 {% endfor %}
 
-- Column Descriptions:
-{% if column_descriptions %}
-{% for key, value in column_descriptions.items() %}
-  **{{ key }}**: {{ value }}
-{% endfor %}
-{% else %}
-  No column descriptions available.
-{% endif %}
-
-- Sample Table:
+### Sample Data:
 {{ table_header }}
 {% for row in sample_rows %}
 {{ row }}
 {% endfor %}
 
-**Final Instruction**: Return only valid JSON with actual data for the GPL, based on the analysis. Do NOT include the placeholder template, code blocks, or any non-JSON content.
+## Required Output (JSON only):
+```json
+{
+  "gpl_id": "{{ gpl_id }}",
+  "organism": "{{ organism }}",
+  "mapping_method": "direct|accession_lookup|coordinate_lookup|unknown",
+  "description": "Selected [field_name] for [mapping_method] based on [population_rate]% population rate and [format_consistency]",
+  "fields_used_for_mapping": ["primary_field_selected"],
+  "alternate_fields_for_mapping": ["other_viable_fields"],
+  "quality_assessment": {
+    "selected_field": "field_name",
+    "population_rate": "percentage",
+    "format_type": "detected_format",
+    "sample_size": {{ sample_size }},
+    "confidence": "high"
+  }
+}
+```
+
+Return only valid JSON with your analysis. Do NOT include the placeholder template, code blocks, or any non-JSON content.
 """.strip()
 
     def __init__(self):
-        """Initialize prompt builder with Jinja2 environment"""
-        self.env = Environment(
-            loader=BaseLoader(),
-            autoescape=select_autoescape(['html', 'xml'])
-        )
+        self.env = Environment(loader=BaseLoader(), autoescape=select_autoescape(['html', 'xml']))
+    
+    def build_prompt(self, gpl_record: Dict[str, Any], quality_analysis: Dict[str, float]) -> str:
+        """Build optimized prompt for large dataset analysis"""
+        gpl_id = gpl_record.get("gpl_id", "")
+        metadata = gpl_record.get("metadata", {})
+        table = gpl_record.get("table", {})
+        columns = table.get("columns", [])
+        sample_rows = table.get("sample_rows", [])
         
-    def build_prompt(self, gpl_record: Dict[str, Any]) -> str:
-        """Build prompt from GPL record using template"""
-        try:
-            # Extract and validate data
-            gpl_id = gpl_record.get("gpl_id", "")
-            metadata = gpl_record.get("metadata", {})
-            table = gpl_record.get("table", {})
-            columns = table.get("columns", [])
-            sample_rows = table.get("sample_rows", [])
-            column_descriptions = metadata.get("column_descriptions", {})
-            
-            # Build template context
-            context = {
-                "gpl_id": gpl_id,
-                "organism": metadata.get("organism", ""),
-                "metadata": {k: v for k, v in metadata.items() if k != "column_descriptions"},
-                "column_descriptions": column_descriptions,
-                "available_fields": columns,
-                "table_header": "\t".join(columns),
-                "sample_rows": []
-            }
-            
-            # Format sample rows (limit to 10)
-            for row in sample_rows[:10]:
-                row_cells = [str(row.get(col, "")) for col in columns]
-                context["sample_rows"].append("\t".join(row_cells))
-            
-            # Render template
-            template = self.env.from_string(self.PROMPT_TEMPLATE)
-            return template.render(**context)
-            
-        except Exception as e:
-            raise GPLInferenceError(f"Failed to build prompt for {gpl_id}: {e}")
+        context = {
+            "gpl_id": gpl_id,
+            "organism": metadata.get("organism", ""),
+            "total_rows": gpl_record.get("total_rows", "50000+"),
+            "sample_size": len(sample_rows),
+            "column_descriptions": metadata.get("column_descriptions", {}),
+            "population_rates":quality_analysis,
+            "table_header": "\t".join(columns),
+            "sample_rows": ["\t".join(str(row.get(col, "")) for col in columns) for row in sample_rows[:50]]
+        }
+        
+        template = self.env.from_string(self.PROMPT_TEMPLATE)
+        return template.render(**context)
 
 
-# API Client
+# API Client (unchanged - already optimized)
 class OpenAIClient:
     """Robust OpenAI API client with retry logic"""
     
@@ -389,7 +443,6 @@ class OpenAIClient:
                 timeout=self.config.timeout
             )
 
-            # Handle rate limiting
             if response.status_code == 429:
                 retry_after = int(response.headers.get('retry-after', 60))
                 raise APIError(f"Rate limited, retry after {retry_after}s")
@@ -402,7 +455,6 @@ class OpenAIClient:
 
             content = result["choices"][0]["message"]["content"].strip()
             
-            # Clean JSON response
             if content.startswith("```json"):
                 content = content[7:].strip()
             if content.endswith("```"):
@@ -426,33 +478,68 @@ class OpenAIClient:
             raise
 
 
-# Main Processing Engine
-class GPLInferenceEngine:
-    """Main processing engine for GPL inference"""
+# Main Optimized Processing Engine
+class OptimizedGPLInferenceEngine:
+    """Optimized processing engine for large datasets"""
     
     def __init__(self, api_config: APIConfig, processing_config: ProcessingConfig):
         self.api_config = api_config
         self.processing_config = processing_config
-        self.prompt_builder = PromptBuilder()
+        self.quality_analyzer = DataQualityAnalyzer(processing_config.sample_size)
+        self.prompt_builder = OptimizedPromptBuilder()
         self.api_client = OpenAIClient(api_config)
-        self.logger = logging.getLogger("gpl_inference.engine")
+        self.logger = logging.getLogger("gpl_inference.optimized_engine")
         
+    def _optimize_gpl_sample(self, gpl_record: Dict[str, Any]) -> Dict[str, Any]:
+        """Optimize sample size for better statistical confidence"""
+        table = gpl_record.get("table", {})
+        all_rows = table.get("sample_rows", [])
+        columns = table.get("columns", [])
+        
+        if len(all_rows) > self.processing_config.sample_size:
+            # Create optimized sample
+            optimized_sample = self.quality_analyzer.optimize_sample(all_rows, columns)
+            
+            # Update the record with optimized sample
+            optimized_record = gpl_record.copy()
+            optimized_record["table"] = table.copy()
+            optimized_record["table"]["sample_rows"] = optimized_sample
+            
+            self.logger.debug(f"Optimized sample for {gpl_record.get('gpl_id')}: "
+                             f"{len(all_rows)} -> {len(optimized_sample)} rows")
+            
+            return optimized_record
+        
+        return gpl_record
+    
     def _process_single_gpl(self, gpl_record: Dict[str, Any], progress: InferenceProgressTracker) -> ProcessingResult:
-        """Process a single GPL record"""
+        """Process a single GPL with optimized sampling"""
         gpl_id = gpl_record.get("gpl_id", "unknown")
         start_time = time.time()
-        retry_count = 0
-
+        
         try:
+            # Optimize sample size
+            optimized_record = self._optimize_gpl_sample(gpl_record)
+            # Quick quality analysis
+            columns = optimized_record.get("table", {}).get("columns", [])
+            sample_rows = optimized_record.get("table", {}).get("sample_rows", [])
+            quality_analysis = self.quality_analyzer.calculate_population_rates(sample_rows, columns)       
             # Build prompt
-            prompt = self.prompt_builder.build_prompt(gpl_record)
+            prompt = self.prompt_builder.build_prompt(optimized_record, quality_analysis)
             
             # Get inference
             result = self.api_client.infer_mapping_strategy(prompt)
             
-            # Validate result is valid JSON
+            # Validate JSON
             try:
-                json.loads(result)
+                parsed_result = json.loads(result)
+                # Add quality metrics
+                parsed_result["sample_optimization"] = {
+                    "original_sample_size": len(gpl_record.get("table", {}).get("sample_rows", [])),
+                    "optimized_sample_size": len(sample_rows),
+                    "total_platform_rows": gpl_record.get("total_rows", "unknown")
+                }
+                result = json.dumps(parsed_result)
             except json.JSONDecodeError:
                 raise GPLInferenceError(f"Invalid JSON response for {gpl_id}")
             
@@ -462,8 +549,7 @@ class GPLInferenceEngine:
                 success=True,
                 result=result,
                 error=None,
-                processing_time=processing_time,
-                retry_count=retry_count
+                processing_time=processing_time
             )
             
         except Exception as e:
@@ -476,50 +562,35 @@ class GPLInferenceEngine:
                 success=False,
                 result=None,
                 error=error_msg,
-                processing_time=processing_time,
-                retry_count=retry_count
+                processing_time=processing_time
             )
 
     def process_gpl_records(self, gpl_records: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Process multiple GPL records with parallel execution
-        
-        Args:
-            gpl_records: List of GPL record dictionaries
-            
-        Returns:
-            Dictionary with results, errors, and statistics
-        """
+        """Process multiple GPL records"""
         if not gpl_records:
             raise ValueError("No GPL records provided")
 
-        self.logger.info(f"Starting processing of {len(gpl_records)} GPL records")
+        self.logger.info(f"Starting optimized processing of {len(gpl_records)} GPL records")
         
-        print(f"🚀 Starting GPL Inference Pipeline")
-        print(f"{'='*60}")
-        print(f"📋 Total GPLs to process: {len(gpl_records)}")
+        print(f"🚀 GPL Inference Pipeline for Large GPL Datasets")
+        print(f"{'='*65}")
+        print(f"📋 Total GPLs: {len(gpl_records)}")
         print(f"👥 Workers: {self.processing_config.max_workers}")
+        print(f"🎯 Target sample size: {self.processing_config.sample_size} rows")
         print(f"🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*60}\n")
+        print(f"{'='*65}\n")
 
-        # Initialize progress tracker
-        progress = InferenceProgressTracker(
-            len(gpl_records), 
-            self.processing_config.progress_update_interval
-        )
-        
+        progress = InferenceProgressTracker(len(gpl_records), self.processing_config.progress_update_interval)
         results = {}
         errors = {}
 
         try:
             with ThreadPoolExecutor(max_workers=self.processing_config.max_workers) as executor:
-                # Submit all tasks
                 future_to_gpl = {
                     executor.submit(self._process_single_gpl, record, progress): record.get("gpl_id", "unknown")
                     for record in gpl_records
                 }
 
-                # Process completed tasks
                 for future in as_completed(future_to_gpl):
                     gpl_id = future_to_gpl[future]
                     try:
@@ -536,29 +607,21 @@ class GPLInferenceEngine:
                         self.logger.error(f"Unexpected error for {gpl_id}: {error_msg}")
                         errors[gpl_id] = error_msg
                         
-                        # Create failed result for progress tracking
                         failed_result = ProcessingResult(
-                            gpl_id=gpl_id,
-                            success=False,
-                            result=None,
-                            error=error_msg,
-                            processing_time=0,
-                            retry_count=0
+                            gpl_id=gpl_id, success=False, result=None,
+                            error=error_msg, processing_time=0
                         )
                         progress.update(failed_result)
 
         except KeyboardInterrupt:
             self.logger.warning("Process interrupted by user")
-            print(f"\n\n⚠️ Process interrupted by user!")
+            print(f"\n\n⚠️ Process interrupted!")
 
         finally:
-            # Print final report
             progress.print_final_report(self.processing_config.max_workers)
-            
             stats = progress.get_final_stats()
             stats = stats._replace(max_workers_used=self.processing_config.max_workers)
-            
-            self.logger.info(f"Processing complete. Success rate: {stats.success_rate_percent:.1f}%")
+            self.logger.info(f"Optimized processing complete. Success rate: {stats.success_rate_percent:.1f}%")
 
         return {
             'results': results,
@@ -569,7 +632,7 @@ class GPLInferenceEngine:
 
 # Configuration Factory
 class ConfigurationFactory:
-    """Factory for creating configurations from environment variables"""
+    """Factory for creating optimized configurations"""
     
     @staticmethod
     def create_api_config(
@@ -587,36 +650,35 @@ class ConfigurationFactory:
                 "(GPT_API_URL, GPT_API_KEY)"
             )
         
-        return APIConfig(
-            api_url=api_url,
-            api_key=api_key,
-            model=model
-        )
+        return APIConfig(api_url=api_url, api_key=api_key, model=model)
     
     @staticmethod
     def create_processing_config(
         max_workers: int = 4,
-        batch_size: int = 100
+        sample_size: int = 400
     ) -> ProcessingConfig:
-        """Create processing configuration"""
+        """Create optimized processing configuration for large datasets"""
         return ProcessingConfig(
             max_workers=max_workers,
-            batch_size=batch_size
+            sample_size=sample_size,
+            min_sample_size=100,
+            quality_threshold=0.7
         )
 
 
 # Main Interface Function
-def process_gpl_inference(
+def process_large_gpl_inference(
     gpl_records: List[Dict[str, Any]],
     api_url: Optional[str] = None,
     api_key: Optional[str] = None,
     model: str = "gpt-4o",
     max_workers: int = 4,
+    sample_size: int = 400,
     log_level: str = "INFO",
     log_file: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Main interface function for GPL inference processing
+    Optimized GPL inference processing for large datasets (50k+ rows)
     
     Args:
         gpl_records: List of GPL record dictionaries
@@ -624,6 +686,7 @@ def process_gpl_inference(
         api_key: OpenAI API key (or set GPT_API_KEY env var)
         model: Model to use for inference
         max_workers: Number of parallel workers
+        sample_size: Optimal sample size for analysis (200 recommended)
         log_level: Logging level
         log_file: Optional log file path
         
@@ -631,23 +694,22 @@ def process_gpl_inference(
         Dictionary with results, errors, and statistics
     """
     
-    # Setup logging
     logger = setup_logging(log_level, log_file)
     
     try:
-        # Create configurations
+        # Create configurations optimized for large datasets
         kwargs = {}
         if api_key:
             kwargs['api_key'] = api_key
         if api_url:
             kwargs['api_url'] = api_url
         api_config = ConfigurationFactory.create_api_config(**kwargs)
-        processing_config = ConfigurationFactory.create_processing_config(max_workers)
+        processing_config = ConfigurationFactory.create_processing_config(max_workers, sample_size)
         
-        # Create and run engine
-        engine = GPLInferenceEngine(api_config, processing_config)
+        # Create and run optimized engine
+        engine = OptimizedGPLInferenceEngine(api_config, processing_config)
         return engine.process_gpl_records(gpl_records)
         
     except Exception as e:
-        logger.error(f"Processing failed: {e}")
+        logger.error(f"Optimized processing failed: {e}")
         raise

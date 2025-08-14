@@ -81,7 +81,7 @@ class ProgressTracker:
 class GPLDatasetBuilder:
     """Class to build a GPL dataset with parallel processing, reusable in other modules"""
     
-    def __init__(self, max_rows: int = 5, max_workers: int = 8):
+    def __init__(self, max_rows: int = 500, max_workers: int = 8):
         """
         Initialize the GPLDatasetBuilder.
         
@@ -374,3 +374,10 @@ class GPLDatasetBuilder:
                 'processed_at': datetime.now().isoformat()
             }
         } 
+    
+
+#metadata_builder = GPLDatasetBuilder(max_workers=2)
+#res = metadata_builder.build_dataset(["GPL5175"])
+#import json
+#with open ("metadata.json", 'w') as f:
+#    json.dump([res['results']['GPL5175']], f, indent=4)

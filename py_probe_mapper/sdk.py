@@ -4,7 +4,7 @@ import pandas as pd
 import json
 from typing import Dict, List
 from py_probe_mapper.metadata_builder.build_metadata import GPLDatasetBuilder
-from py_probe_mapper.lookup_classifier.gpt_lookup_classifier import process_gpl_inference
+from py_probe_mapper.lookup_classifier.optimised_lookup_classifier import process_large_gpl_inference
 from py_probe_mapper.accession_lookup.accession_lookup import AccessionLookupGPLProcessor 
 from py_probe_mapper.coordinate_lookup.coordinate_lookup import CoordinateLookupGPLProcessor
 
@@ -48,7 +48,7 @@ def runner(gpl_ids: List[str], api_url: str = None, api_key: str = None) -> None
         kwargs['api_key'] = api_key
     if api_url:
         kwargs['api_url'] = api_url
-    lookup_res = process_gpl_inference(lookup_input, **kwargs)
+    lookup_res = process_large_gpl_inference(lookup_input, **kwargs)
     mapping_input = [x for x in lookup_res['results'].values()]
     accession_mappings = []
     coordinate_mappings = []
@@ -80,4 +80,4 @@ def runner(gpl_ids: List[str], api_url: str = None, api_key: str = None) -> None
     return
 
 if __name__ == '__main__':
-    runner(["GPL10559"])
+    runner(["GPL3558"])
