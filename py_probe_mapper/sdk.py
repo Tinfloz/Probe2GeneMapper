@@ -1,12 +1,14 @@
 import fsspec
 import zarr
 import pandas as pd
+from huggingface_hub import HfApi
 import json
 from typing import Dict, List
 from py_probe_mapper.metadata_builder.build_metadata import GPLDatasetBuilder
 from py_probe_mapper.lookup_classifier.optimised_lookup_classifier import process_large_gpl_inference
 from py_probe_mapper.accession_lookup.accession_lookup import AccessionLookupGPLProcessor 
 from py_probe_mapper.coordinate_lookup.coordinate_lookup import CoordinateLookupGPLProcessor
+from py_probe_mapper.direct_lookup.direct_lookup import DirectLookupGPLProcessor
 
 def fetch_gene_to_probe_mappings(gpl_id: str, return_dataframe: bool = False) -> Dict[str, str]:
     try:
@@ -27,6 +29,22 @@ def fetch_gene_to_probe_mappings(gpl_id: str, return_dataframe: bool = False) ->
         return {row['probe_id']:row['gene_symbol'] for _, row in df.iterrows()}
     except Exception as e:
         return {}
+
+
+def push_to_huggingface():
+    """Push Zarr dataset to HuggingFace Hub."""
+    repo = "Tinfloz/probe-gene-map"
+    hf_api = HfApi()
+    zarr_path = "gpl_mappings.zarr"
+    try:
+        hf_api.upload_large_folder(
+            folder_path=str(zarr_path),
+            repo_id=repo,
+            repo_type="dataset"
+        )
+        print(f"Successfully pushed to: https://huggingface.co/datasets/{repo}")
+    except Exception as e:
+        print(f"Failed to push to HuggingFace: {str(e)}")
 
 def runner(gpl_ids: List[str], api_url: str = None, api_key: str = None) -> None:
     to_be_mapped = []
@@ -52,6 +70,7 @@ def runner(gpl_ids: List[str], api_url: str = None, api_key: str = None) -> None
     mapping_input = [x for x in lookup_res['results'].values()]
     accession_mappings = []
     coordinate_mappings = []
+    direct_mappings = []
     for i in mapping_input:
         try:
             json_i = json.loads(i)
@@ -62,9 +81,12 @@ def runner(gpl_ids: List[str], api_url: str = None, api_key: str = None) -> None
             accession_mappings.append(json_i)
         elif json_i['mapping_method'] == "coordinate_lookup":
             coordinate_mappings.append(json_i)
+        elif json_i['mapping_method'] == "direct":
+            direct_mappings.append(json_i)
         else:
             continue
     if len(accession_mappings) != 0:
+        print("using accession_lookup")
         accession_processor = AccessionLookupGPLProcessor(gpl_records=accession_mappings, zarr_path="gpl_mappings.zarr")
         mappings = accession_processor.process_all_enhanced()
         for i in mappings.keys():
@@ -77,7 +99,15 @@ def runner(gpl_ids: List[str], api_url: str = None, api_key: str = None) -> None
         for i in mappings.keys():
             with open(f"{i}_mappings.json", 'w') as f:
                 json.dump(mappings[i], f, indent=4)
+    if len(direct_mappings) != 0:
+        print("Using direct lookup")
+        direct_processor = DirectLookupGPLProcessor(gpl_records=direct_mappings, zarr_path="gpl_mappings.zarr")
+        mappings = direct_processor.process_all_enhanced()
+        for i in mappings.keys():
+            with open(f"{i}_mappings.json", 'w') as f:
+                json.dump(mappings[i], f, indent=4)
+    push_to_huggingface()
     return
 
 if __name__ == '__main__':
-    runner(["GPL3558"])
+    runner(["GPL5265", "GPL5250"])

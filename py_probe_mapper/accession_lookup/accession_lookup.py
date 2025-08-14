@@ -459,15 +459,15 @@ class AccessionLookupGPLProcessor:
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger("EnhancedGPLProcessor")
-        try:
-            self.hf_api = HfApi()
-            self.logger.info(f"HuggingFace integration enabled for repo: {self.hf_repo}")
-        except ImportError:
-            self.logger.error("HuggingFace Hub not installed. Install with: pip install huggingface_hub")
-            raise
-        except Exception as e:
-            self.logger.error(f"Failed to initialize HuggingFace API: {e}")
-            raise
+        #try:
+        #    self.hf_api = HfApi()
+        #    self.logger.info(f"HuggingFace integration enabled for repo: {self.hf_repo}")
+        #except ImportError:
+        #    self.logger.error("HuggingFace Hub not installed. Install with: pip install huggingface_hub")
+        #    raise
+        #except Exception as e:
+        #    self.logger.error(f"Failed to initialize HuggingFace API: {e}")
+        #    raise
 
     def filter_records(self) -> List[Dict[str, Any]]:
         """Filter GPL records for processing."""
@@ -551,18 +551,18 @@ class AccessionLookupGPLProcessor:
         }
         gpl_group.attrs.update(attrs_dict)
 
-    def push_to_huggingface(self):
-        """Push Zarr dataset to HuggingFace Hub."""
-        self.logger.info(f"Pushing to HuggingFace: {self.hf_repo}")
-        try:
-            self.hf_api.upload_large_folder(
-                folder_path=str(self.zarr_path),
-                repo_id=self.hf_repo,
-                repo_type="dataset"
-            )
-            self.logger.info(f"Successfully pushed to: https://huggingface.co/datasets/{self.hf_repo}")
-        except Exception as e:
-            self.logger.error(f"Failed to push to HuggingFace: {str(e)}")
+    #def push_to_huggingface(self):
+    #    """Push Zarr dataset to HuggingFace Hub."""
+    #    self.logger.info(f"Pushing to HuggingFace: {self.hf_repo}")
+    #    try:
+    #        self.hf_api.upload_large_folder(
+    #            folder_path=str(self.zarr_path),
+    #            repo_id=self.hf_repo,
+    #            repo_type="dataset"
+    #        )
+    #        self.logger.info(f"Successfully pushed to: https://huggingface.co/datasets/{self.hf_repo}")
+    #    except Exception as e:
+    #        self.logger.error(f"Failed to push to HuggingFace: {str(e)}")
 
     def process_all_enhanced(self):
         """Process all GPL records and initiate asynchronous HuggingFace upload."""
@@ -614,9 +614,9 @@ class AccessionLookupGPLProcessor:
             }
         })
         # Start asynchronous upload to HuggingFace
-        upload_thread = Thread(target=self.push_to_huggingface)
-        upload_thread.start()
-        self.logger.info("Started asynchronous upload to HuggingFace; processing complete")
+        #upload_thread = Thread(target=self.push_to_huggingface)
+        #upload_thread.start()
+        self.logger.info("Processing complete")
         return new_mappings
 
     def get_gpl_mapping(self, gpl_id: str) -> Optional[Dict[str, str]]:
