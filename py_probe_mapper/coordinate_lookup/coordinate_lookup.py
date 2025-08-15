@@ -382,9 +382,9 @@ class CoordinateLookupGPLMapperUtils(EnhancedGPLMapperV2):
                     value = next(iter(v.values()))
                 except StopIteration:
                     continue
-                if k.lower() == "spot_id":
+                if k == "spot_id":
                     spot_id = value  # Defer processing until after loop
-                elif k.lower() in ["chromosome", "chrom"] and lookup_values["chromosome"] is None:
+                elif k == "chromosome" and lookup_values["chromosome"] is None:
                     lookup_values["chromosome"] = CoordinateLookupGPLMapperUtils.normalise_chromosome(value)
                 elif k == "range_gb" and lookup_values["chromosome"] is None:
                     lookup_values["chromosome"] = CoordinateLookupGPLMapperUtils.get_chr_from_range_gb_batch(value)

@@ -258,10 +258,6 @@ class DataQualityAnalyzer:
                 f"Column {col}, Population Rate: {population_rate}% ({len(sample_rows) - empty_count}/{len(sample_rows)}), "
                 f"Empty Count: {empty_count}"
             )
-            print(
-                f"DEBUG: Column {col}, Population Rate: {population_rate}% ({len(sample_rows) - empty_count}/{len(sample_rows)}), "
-                f"Empty Count: {empty_count}"
-            )
             
             population_rates[col] = population_rate
         

@@ -13,7 +13,6 @@ import zarr
 import numpy as np
 from tqdm import tqdm
 import multiprocessing as mp
-from huggingface_hub import HfApi
 import gzip
 
 # Fix for Zarr compressor compatibility
@@ -459,15 +458,6 @@ class AccessionLookupGPLProcessor:
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger("EnhancedGPLProcessor")
-        #try:
-        #    self.hf_api = HfApi()
-        #    self.logger.info(f"HuggingFace integration enabled for repo: {self.hf_repo}")
-        #except ImportError:
-        #    self.logger.error("HuggingFace Hub not installed. Install with: pip install huggingface_hub")
-        #    raise
-        #except Exception as e:
-        #    self.logger.error(f"Failed to initialize HuggingFace API: {e}")
-        #    raise
 
     def filter_records(self) -> List[Dict[str, Any]]:
         """Filter GPL records for processing."""
@@ -550,19 +540,7 @@ class AccessionLookupGPLProcessor:
             'stats': enhanced_stats
         }
         gpl_group.attrs.update(attrs_dict)
-
-    #def push_to_huggingface(self):
-    #    """Push Zarr dataset to HuggingFace Hub."""
-    #    self.logger.info(f"Pushing to HuggingFace: {self.hf_repo}")
-    #    try:
-    #        self.hf_api.upload_large_folder(
-    #            folder_path=str(self.zarr_path),
-    #            repo_id=self.hf_repo,
-    #            repo_type="dataset"
-    #        )
-    #        self.logger.info(f"Successfully pushed to: https://huggingface.co/datasets/{self.hf_repo}")
-    #    except Exception as e:
-    #        self.logger.error(f"Failed to push to HuggingFace: {str(e)}")
+        
 
     def process_all_enhanced(self):
         """Process all GPL records and initiate asynchronous HuggingFace upload."""
