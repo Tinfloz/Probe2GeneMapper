@@ -21,3 +21,5 @@ dependencies = [
 ]
 [project.scripts]
 probe-mapper = "py_probe_mapper.cli:run_cli"
+[tool.setuptools.package-data]
+py_probe_mapper = ["genome_utils/Homo_sapiens.GRCh38.genes.tsv"]
