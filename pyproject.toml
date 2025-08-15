@@ -1,8 +1,10 @@
 [project]
 name = "py_probe_mapper"
 version = "0.1.0"
-description = "Add your description here"
+description = "A lightweight Python package for mapping GEO platform probes to their corresponding gene identifiers in seconds!"
 readme = "README.md"
+license = "AGPL-3.0"
+authors = [{ name = "Swapnonil Chakraborty", email = "swapnonil0007@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.12.15",
@@ -11,8 +13,11 @@ dependencies = [
     "numpy>=2.3.2",
     "pandas>=2.3.1",
     "python-dotenv>=1.1.1",
+    "questionary>=2.1.0",
     "requests>=2.32.4",
     "tenacity>=9.1.2",
     "tqdm>=4.67.1",
     "zarr>=3.1.1",
 ]
+[project.scripts]
+probe-mapper = "py_probe_mapper.cli:run_cli"
